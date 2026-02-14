@@ -9,6 +9,10 @@ Hard constraints on U1:
 
 ## Installation (U1)
 
+Put this repo onto the printer first. The paths below assume:
+
+- Save location: `/home/lava/chopper-resonance-tuner/`
+
 Manual install (symlink into Klipper):
 
 ```sh
@@ -16,6 +20,8 @@ Manual install (symlink into Klipper):
 ln -sf /home/lava/chopper-resonance-tuner/chopper_tune.py /home/lava/klipper/klippy/extras/chopper_tune.py
 cp -f /home/lava/chopper-resonance-tuner/chopper_tune.cfg /home/lava/printer_data/config/chopper_tune.cfg
 ```
+
+If you use a different repo path, update the `ln -sf` / `cp -f` paths accordingly.
 
 Ensure your config includes `chopper_tune.cfg`.
 
@@ -75,12 +81,25 @@ driver_tpfd: <Y>
 
 Restart Klipper to apply the override.
 
+4. Effect on sensorless homing:
+Sensorless homing might need re-adjusting.
+
+Example:
+```ini
+[tmc2240 stepper_x]
+driver_SGT: 2 # Default is 1 / higher = less sensitivity 
+
+[tmc2240 stepper_y]
+driver_SGT: 2 # Default is 1 / higher = less sensitivity
+```
+
 ## Command Reference (U1)
 
 Main command:
 
 ```gcode
-CHOPPER_TUNE AXIS=X
+CHOPPER_TUNE AXIS=X QUICK=0 HOME=0
+CHOPPER_TUNE AXIS=Y QUICK=0 HOME=0
 ```
 
 Parameters:
