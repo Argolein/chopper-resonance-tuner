@@ -1167,6 +1167,7 @@ class ChopperTune:
         #
         # Note: Snapmaker's `homing_xyz_override` may perform a Z-hop when Z is
         # not homed. Avoid re-homing if XY are already homed.
+        self.toolhead.wait_moves()
         curtime = self.reactor.monotonic()
         status = self.toolhead.get_status(curtime)
         homed_axes = set(str(status.get("homed_axes", "")).lower())
@@ -2779,9 +2780,9 @@ class ChopperTune:
         Returns:
             bool: True if command completed successfully, False otherwise.
         """
-        self.reactor.register_callback(
-            lambda e: self.parse_args_and_run_optimization(gcmd)
-        )
+        # Run synchronously in the gcode handler context (matches how U1's
+        # resonance_tester executes its own homing + motion workflows).
+        self.parse_args_and_run_optimization(gcmd)
         return True
 
     def parse_args_and_run_optimization(self, gcmd: GCodeCommand) -> None:
