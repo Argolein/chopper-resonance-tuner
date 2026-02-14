@@ -11,7 +11,7 @@ if [ "$(id -u)" = "0" ]; then
     exit 1
 fi
 
-result_folder=~/printer_data/config/adxl_results/chopper_magnitude
+result_folder=/data/gcodes/chopper-tuner
 if [ ! -d "$result_folder" ]; then # Check folder chopper_magnitude & create
     mkdir -p "$result_folder"
     # echo "Make $result_folder direction successfully complete"
@@ -78,8 +78,6 @@ if [ -f "$blk_path" ]; then
     fi
 fi
 
-# Install Python dependencies to Klipper
-source ~/klippy-env/bin/activate
-pip install uv
-uv pip install -r $repo_path/requirements.txt
-deactivate
+# U1 policy: Klipper runtime must not depend on third-party Python packages.
+# (Local dev dependencies may still exist in requirements.txt for analysis tooling.)
+echo "Skipping Python dependency installation (stdlib-only runtime)."

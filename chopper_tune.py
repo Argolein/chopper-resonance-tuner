@@ -12,24 +12,23 @@ This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 
 import json
+import math
 import os
+import platform
+import statistics
 import traceback
 from datetime import datetime
 from enum import IntEnum
 from functools import reduce
+from pathlib import Path
 from typing import TYPE_CHECKING
-
-# Third Party Imports
-import numpy as np
-from scipy import signal
-from scipy.optimize import brute, differential_evolution
 
 if TYPE_CHECKING:
     import sys
     from types import TracebackType
 
     from configfile import ConfigWrapper
-    from extras.adxl345 import ADXL345, Accel_Measurement
+    from extras.adxl345 import Accel_Measurement
     from gcode import GCodeCommand, GCodeDispatch
     from klippy import Printer
     from reactor import PollReactor
@@ -42,12 +41,13 @@ if TYPE_CHECKING:
 
 
 DEFAULT_ACCEL_CHIP = "adxl345"
-RESULTS_FOLDER = os.path.expanduser(
-    "~/printer_data/config/adxl_results/chopper_magnitude"
-)
-DATA_FOLDER = os.path.expanduser(
-    "~/printer_data/config/adxl_results/chopper_magnitude/tmp"
-)
+
+# Snapmaker U1 policy: all artifacts must live under this folder.
+U1_LOG_ROOT = "/data/gcodes/chopper-tuner"
+
+# Backwards-compat aliases for legacy code paths (kept non-/tmp).
+RESULTS_FOLDER = U1_LOG_ROOT
+DATA_FOLDER = os.path.join(U1_LOG_ROOT, "tmp")
 
 FCLK = 12  # MHz
 CUTOFF_RANGE = 5
@@ -177,16 +177,17 @@ class AccelerometerMeasure:
 
     def __init__(
         self,
-        adxl345: ADXL345,
+        accel_chip: object,
     ) -> None:
-        self.adxl345 = adxl345
+        self.accel_chip = accel_chip
         self.bg_client = None
         self.samples: None | list[Accel_Measurement] = None
 
     def __enter__(self) -> Self:
         """Enter to the context."""
         if self.bg_client is None:
-            self.bg_client = self.adxl345.start_internal_client()
+            # Both adxl345 and lis2dw on the U1 support this API.
+            self.bg_client = self.accel_chip.start_internal_client()
         return self
 
     def __exit__(
@@ -476,7 +477,6 @@ class ChopperTune:
         self.gcode: GCodeDispatch = self.printer.lookup_object("gcode")
         self.configfile = self.printer.lookup_object("configfile")
         self.toolhead: None | ToolHead = None
-        self.adxl345: None | ADXL345 = None
         self.settings = None
         self.reactor: PollReactor = self.printer.get_reactor()
         self.driver_settings = {}
@@ -566,7 +566,8 @@ class ChopperTune:
             self.stepper_settings[f"stepper_{axis}"] = self.settings.get(
                 f"stepper_{axis}", {}
             )
-        self.adxl345 = self.printer.lookup_object("adxl345")
+        # Do not resolve the accelerometer here; on U1 we use LIS2DW on Tool 0
+        # and will resolve it dynamically from [resonance_tester].
 
     def detect_driver(self, stepper: str) -> None | tuple[str, str]:
         """Detect the driver of the selected stepper.
@@ -1162,7 +1163,16 @@ class ChopperTune:
 
     def home(self) -> None:
         """Home."""
-        self.gcode.run_script_from_command("G28 X Y Z")
+        # U1 policy: home X/Y only (no Z) for chopper tuning.
+        #
+        # Note: Snapmaker's `homing_xyz_override` may perform a Z-hop when Z is
+        # not homed. Avoid re-homing if XY are already homed.
+        curtime = self.reactor.monotonic()
+        status = self.toolhead.get_status(curtime)
+        homed_axes = set(str(status.get("homed_axes", "")).lower())
+        if "x" in homed_axes and "y" in homed_axes:
+            return
+        self.gcode.run_script_from_command("G28 X Y")
         self.toolhead.wait_moves()
 
     def get_standing_acceleration(self) -> list[Accel_Measurement]:
@@ -1175,7 +1185,9 @@ class ChopperTune:
             list[Accel_Measurement]: The measurement data samples.
         """
         self.toolhead.wait_moves()
-        with AccelerometerMeasure(self.adxl345) as accelerometer_measurement:
+        accel_chip_name = self.get_accelerometer_chip("default")
+        accel_obj = self.printer.lookup_object(accel_chip_name)
+        with AccelerometerMeasure(accel_obj) as accelerometer_measurement:
             self.toolhead.dwell(5.0)
         return accelerometer_measurement.samples
 
@@ -1198,7 +1210,9 @@ class ChopperTune:
             list[Accel_Measurement]: The measurement data samples.
         """
         # Start accel_chip data collection
-        with AccelerometerMeasure(adxl345=self.adxl345) as accelerometer_measurement:
+        accel_chip_name = self.get_accelerometer_chip("default")
+        accel_obj = self.printer.lookup_object(accel_chip_name)
+        with AccelerometerMeasure(accel_obj) as accelerometer_measurement:
             next_coord = coord_generator.next(travel_distance)
             self.toolhead.manual_move(next_coord, speed)
         # Move to the initial position
@@ -1285,15 +1299,57 @@ class ChopperTune:
         Returns:
             tuple[float, float, float]: Mean static acceleration vector.
         """
-        accel_x = np.array([sample.accel_x for sample in samples])
-        accel_y = np.array([sample.accel_y for sample in samples])
-        accel_z = np.array([sample.accel_z for sample in samples])
-        # Return the mean of each axis as the baseline vector
-        return (
-            float(np.mean(accel_x)),
-            float(np.mean(accel_y)),
-            float(np.mean(accel_z)),
-        )
+        if not samples:
+            return (0.0, 0.0, 0.0)
+
+        # Mean baseline vector (gravity + static vibration).
+        sx = sy = sz = 0.0
+        for s in samples:
+            sx += float(getattr(s, "accel_x"))
+            sy += float(getattr(s, "accel_y"))
+            sz += float(getattr(s, "accel_z"))
+        n = float(len(samples))
+        return (sx / n, sy / n, sz / n)
+
+    def _single_pole_lpf(
+        self, values: list[float], cutoff_hz: float, sample_rate_hz: float
+    ) -> list[float]:
+        """Cheap IIR low-pass filter (pure Python).
+
+        y[n] = y[n-1] + alpha * (x[n] - y[n-1])
+        """
+        if not values:
+            return []
+        if cutoff_hz <= 0 or sample_rate_hz <= 0:
+            return list(values)
+        dt = 1.0 / float(sample_rate_hz)
+        rc = 1.0 / (2.0 * math.pi * float(cutoff_hz))
+        alpha = dt / (rc + dt)
+
+        out: list[float] = []
+        y = float(values[0])
+        out.append(y)
+        for x in values[1:]:
+            y = y + alpha * (float(x) - y)
+            out.append(y)
+        return out
+
+    def _quantile(self, sorted_values: list[float], q: float) -> float:
+        """Linear-interpolated quantile for a sorted list."""
+        if not sorted_values:
+            return 0.0
+        if q <= 0:
+            return float(sorted_values[0])
+        if q >= 1:
+            return float(sorted_values[-1])
+        n = len(sorted_values)
+        pos = (n - 1) * float(q)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return float(sorted_values[lo])
+        frac = pos - lo
+        return float(sorted_values[lo]) * (1.0 - frac) + float(sorted_values[hi]) * frac
 
     def calc_magnitude(
         self, samples: list[Accel_Measurement], static_data: tuple[float, float, float]
@@ -1308,314 +1364,888 @@ class ChopperTune:
         Returns:
             float: Median magnitude of acceleration data.
         """
-        accel_x = np.array([sample.accel_x for sample in samples]) - static_data[0]
-        accel_y = np.array([sample.accel_y for sample in samples]) - static_data[1]
-        accel_z = np.array([sample.accel_z for sample in samples]) - static_data[2]
+        if not samples:
+            return float("inf")
 
-        magnitudes = np.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
+        # Subtract baseline vector and compute magnitude.
+        mags: list[float] = []
+        bx, by, bz = static_data
+        for s in samples:
+            x = float(getattr(s, "accel_x")) - bx
+            y = float(getattr(s, "accel_y")) - by
+            z = float(getattr(s, "accel_z")) - bz
+            mags.append(math.sqrt(x * x + y * y + z * z))
 
-        # Create a 4th order Butterworth filter
-        cutoff_freq = 150  # Hz
-        nyquist_freq = self.adxl345.data_rate / 2
-        normal_cutoff = cutoff_freq / nyquist_freq
+        # Determine sample rate (lis2dw on U1 exposes data_rate=1600).
+        # Fallback to a sane default if not available.
+        sample_rate_hz = float(getattr(self, "_accel_data_rate_hz", 1600.0))
 
-        b, a = signal.butter(4, normal_cutoff, btype="low", analog=False)
-        filtered_magnitudes = signal.filtfilt(b, a, magnitudes)
+        cutoff_hz = float(getattr(self, "_lpf_cutoff_hz", 150.0))
+        mags = self._single_pole_lpf(mags, cutoff_hz=cutoff_hz, sample_rate_hz=sample_rate_hz)
 
-        # Percentile Trimming (The "Middle 60%")
-        lower_bound = np.percentile(filtered_magnitudes, 20)
-        upper_bound = np.percentile(filtered_magnitudes, 80)
-        trimmed_magnitudes = filtered_magnitudes[
-            (filtered_magnitudes >= lower_bound) & (filtered_magnitudes <= upper_bound)
-        ]
-        return float(np.median(trimmed_magnitudes))
+        mags_sorted = sorted(mags)
+        lo = self._quantile(mags_sorted, 0.20)
+        hi = self._quantile(mags_sorted, 0.80)
+        trimmed = [m for m in mags_sorted if lo <= m <= hi]
+        if not trimmed:
+            trimmed = mags_sorted
+        return float(statistics.median(trimmed))
+
+    def _u1_parse_xy_pair(self, value: object) -> tuple[float, float]:
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            return float(value[0]), float(value[1])
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(",")]
+            if len(parts) >= 2:
+                return float(parts[0]), float(parts[1])
+        raise ValueError(f"Invalid XY pair: {value!r}")
+
+    def _u1_get_safe_xy_bounds(self, inset: float) -> tuple[float, float, float, float]:
+        """Return (xmin, xmax, ymin, ymax) safe working bounds for tuning moves."""
+        bed_mesh = self.settings.get("bed_mesh") if self.settings else None
+        if bed_mesh and "mesh_min" in bed_mesh and "mesh_max" in bed_mesh:
+            mx0, my0 = self._u1_parse_xy_pair(bed_mesh["mesh_min"])
+            mx1, my1 = self._u1_parse_xy_pair(bed_mesh["mesh_max"])
+            xmin, xmax = mx0, mx1
+            ymin, ymax = my0, my1
+        else:
+            # Fallback to configured axis limits.
+            xmin = float(self.stepper_settings["stepper_x"]["position_min"])
+            xmax = float(self.stepper_settings["stepper_x"]["position_max"])
+            ymin = float(self.stepper_settings["stepper_y"]["position_min"])
+            ymax = float(self.stepper_settings["stepper_y"]["position_max"])
+
+        xmin += inset
+        ymin += inset
+        xmax -= inset
+        ymax -= inset
+        if xmax <= xmin or ymax <= ymin:
+            raise self.printer.command_error(
+                f"INSET={inset} leaves no valid work area (xmin/xmax/ymin/ymax = {xmin}/{xmax}/{ymin}/{ymax})"
+            )
+        return xmin, xmax, ymin, ymax
+
+    def _u1_max_travel_distance_xy(
+        self,
+        center_x: float,
+        center_y: float,
+        dir_x: float,
+        dir_y: float,
+        xmin: float,
+        xmax: float,
+        ymin: float,
+        ymax: float,
+    ) -> float:
+        """Max travel distance centered on (center_x, center_y) along direction."""
+        eps = 1e-9
+        half_limits: list[float] = []
+        if abs(dir_x) > eps:
+            half_limits.append((center_x - xmin) / abs(dir_x))
+            half_limits.append((xmax - center_x) / abs(dir_x))
+        if abs(dir_y) > eps:
+            half_limits.append((center_y - ymin) / abs(dir_y))
+            half_limits.append((ymax - center_y) / abs(dir_y))
+        if not half_limits:
+            return 0.0
+        half = max(0.0, min(half_limits))
+        return 2.0 * half
+
+    def _u1_set_accel(self, accel: float) -> None:
+        """Set toolhead accel in a way that's compatible with vendor Klipper builds."""
+        if accel is None:
+            return
+        accel_f = float(accel)
+        if hasattr(self.toolhead, "set_accel"):
+            self.toolhead.set_accel(accel_f)
+            return
+        # Fallback: use gcode interface if available.
+        self.gcode.run_script_from_command(f"SET_VELOCITY_LIMIT ACCEL={accel_f:.3f}")
+
+    def _u1_make_run_dirs(self, log_root: str) -> dict[str, Path]:
+        base = Path(log_root)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = base / "runs" / stamp
+        logs_dir = run_dir / "logs"
+        results_dir = run_dir / "results"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        return {"base": base, "run": run_dir, "logs": logs_dir, "results": results_dir}
+
+    def _u1_write_json(self, path: Path, payload: object) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+
+    def _u1_write_samples_csv(self, path: Path, samples: list[Accel_Measurement]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as f:
+            f.write("#time,accel_x,accel_y,accel_z\n")
+            for s in samples:
+                f.write(
+                    "%.6f,%.6f,%.6f,%.6f\n"
+                    % (
+                        float(getattr(s, "time")),
+                        float(getattr(s, "accel_x")),
+                        float(getattr(s, "accel_y")),
+                        float(getattr(s, "accel_z")),
+                    )
+                )
+
+    def _u1_noise_penalty_factor(self, freq_hz: float, mode: str) -> float:
+        """Return multiplicative score factor >= 1.0."""
+        mode = (mode or "none").lower()
+        if mode == "none":
+            return 1.0
+        if freq_hz <= 0:
+            return 1.0
+        threshold = 20_000.0
+        if freq_hz >= threshold:
+            return 1.0
+        weight = {"moderate": 0.10, "strict": 0.25}.get(mode)
+        if weight is None:
+            raise self.printer.command_error(
+                "NOISE_PENALTY must be one of: none, moderate, strict"
+            )
+        return 1.0 + weight * ((threshold / freq_hz) - 1.0)
+
+    def _u1_measure_move(
+        self,
+        accel_obj: object,
+        start: Coord,
+        end: Coord,
+        speed: float,
+    ) -> list[Accel_Measurement]:
+        # Move into position at travel speed (not part of measurement).
+        self.toolhead.manual_move(start, self.travel_speed)
+        self.toolhead.wait_moves()
+        with AccelerometerMeasure(accel_obj) as m:
+            self.toolhead.manual_move(end, speed)
+        self.number_of_real_samples += 1
+        return m.samples or []
+
+    def _u1_lookup_accel_object(self, accel_chip_name: str) -> object:
+        """Best-effort lookup for accel objects on vendor Klipper builds."""
+        name = (accel_chip_name or "").strip()
+        try:
+            return self.printer.lookup_object(name)
+        except Exception:
+            pass
+        # Some configs may specify only the suffix (e.g. "e0_lis2dw").
+        if " " not in name:
+            for prefix in ("lis2dw ", "adxl345 ", "mpu9250 "):
+                try:
+                    return self.printer.lookup_object(prefix + name)
+                except Exception:
+                    continue
+        # Re-raise with a clearer message.
+        raise self.printer.command_error(
+            f"Unable to lookup accelerometer object '{accel_chip_name}'. "
+            "Expected something like 'lis2dw e0_lis2dw'."
+        )
+
+    def _u1_measure_score(
+        self,
+        accel_obj: object,
+        static_vec: tuple[float, float, float],
+        start: Coord,
+        end: Coord,
+        speed: float,
+        cache: dict[tuple, float],
+        cache_key: tuple,
+    ) -> float:
+        if cache_key in cache:
+            return cache[cache_key]
+        total = 0.0
+        for _ in range(max(1, int(self.iterations))):
+            samples = self._u1_measure_move(accel_obj, start=start, end=end, speed=speed)
+            total += self.calc_magnitude(samples=samples, static_data=static_vec)
+            # Yield control back to Klipper.
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        score = total / max(1, int(self.iterations))
+        cache[cache_key] = score
+        return score
 
     def chopper_tune(
         self,
         axis: str,
-        current_min: None | int = None,
-        current_max: None | int = None,
-        tbl_min: int = 0,
-        tbl_max: int = 3,
-        toff_min: int = 1,
-        toff_max: int = 8,
-        hstrt_hend_max: int = 16,
-        hstrt_min: int = 0,
-        hstrt_max: int = 7,
-        hend_min: int = 2,
-        hend_max: int = 15,
-        tpfd_min: int = -1,
-        tpfd_max: int = -1,
-        min_speed: None | int = None,
-        max_speed: None | int = None,
-        speed_change_step: None | int = None,
-        search_method: SearchMethod = SearchMethod.BruteForce,
-        travel_distance: None | int = None,
-        direction: int = 1,
-        accel_chip: str = "default",
-        run_plotter: bool = True,
-        compare_with: None | str = None,
-    ) -> None | dict:
-        """Measure vibrations and tune stepper motors for low noise.
+        *,
+        quick: bool,
+        home: bool,
+        tool: int,
+        accel_chip: str,
+        inset: float,
+        baseline_dwell: float,
+        lpf_cutoff_hz: float,
+        noise_penalty: str,
+        raw: bool,
+        log_path: str,
+    ) -> dict:
+        """Snapmaker U1 phased tuner (stdlib-only).
 
-        Args:
-            axis (str): Axis to tune. Should be one of ["x", "y", "z"].
-            current_min (None | int): Minimum steeper current in mA, or use
-                None to set the current to the `run_current` value.
-            current_max (None | int): Maximum steeper current in mA, or use
-                None to set the current to the `run_current` value.
-            tbl_min (int): The min TBL value.
-            tbl_max (int): The max TBL value.
-            toff_min (int): The min TOFF value.
-            toff_max (int): The max TOFF value.
-            hstrt_hend_max (int): The max HSTRT_HEND value
-            hstrt_min (int): The min HSTRT value.
-            hstrt_max (int): The max HSTRT value.
-            hend_min (int): The min HEND value.
-            hend_max (int): The max HEND value.
-            tpfd_min (int): The min TPFD value.
-            tpfd_max (int): The max TPFD value.
-            min_speed (None | int): The in speed value, or can be set to
-                None to auto calculate the value over the required RPM
-                value.
-            max_speed (None | int): The max speed value, or can be set to
-                None to auto calculate the value over the required RPM
-                value.
-            speed_change_step (None | int): The step in each iteration the speed
-                will be increased to.
-            search_method (SearchMethod): The search method, can be one of
-                [SearchMethod.BruteForce, SearchMethod.Adaptive], default value
-                is SearchMethod.BruteForce.
-            travel_distance (None | int): The travel distance, or can be set to
-                None to calculate the travel distance with the
-                `measure_time`, `max_speed` and `accel_decel_distance`.
-            direction (int): The movement direction, can be 1 or -1.
-                1 means starting from the minimum position to maximum position,
-                -1 means starting from the maximum position to minimum position.
-            accel_chip (str): The name of the acceleration chip.
-            run_plotter (bool): If set to True, the magnitude graphs will be
-                generated after the vibration measurements are completed.
-            compare_with (None | str): The name of the previous sample set to
-                compare with.
-
-        Returns:
-            None | dict: The best parameters found, or None if tuning was not
-                done using the adaptive method.
+        Returns the chosen parameter set (also written via configfile.set()).
         """
-        # reset previous run data
+        if self.printer.is_shutdown():
+            raise self.printer.command_error(
+                "Klipper is in shutdown state. Run FIRMWARE_RESTART (or reboot) and home the printer, then retry."
+            )
+
+        if axis not in ("x", "y"):
+            raise self.printer.command_error("AXIS must be X or Y on CoreXY U1")
+        if tool != 0:
+            raise self.printer.command_error("TOOL must be 0 on Snapmaker U1")
+
+        # Reset per-run state.
         self.reset_sample_data()
         self.reset_registers()
 
-        self.search_method = search_method
+        run_dirs = self._u1_make_run_dirs(log_path)
+        run_meta: dict[str, object] = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "log_root": log_path,
+            "axis": axis,
+            "quick": bool(quick),
+            "home": bool(home),
+            "tool": int(tool),
+            "inset": float(inset),
+            "baseline_dwell": float(baseline_dwell),
+            "lpf_cutoff_hz": float(lpf_cutoff_hz),
+            "noise_penalty": str(noise_penalty),
+            "raw": bool(raw),
+            "python": {
+                "version": platform.python_version(),
+                "implementation": platform.python_implementation(),
+            },
+            "klipper": {
+                "software_version": self.printer.get_start_args().get("software_version"),
+            },
+        }
 
-        # Force brute_force in vibration measurement mode
-        if self.measurement_mode == MeasurementMode.Resonances:
-            self.search_method = SearchMethod.BruteForce
+        # Phase 0: setup
+        if home:
+            self.home()
+        # U1 convention (see firmware): T0 A0
+        self.gcode.run_script_from_command("T0 A0")
+        self.toolhead.wait_moves()
 
-        self.gcode.respond_info(f"Selected {self.search_method} as search method")
-
-        measure_time = self.measure_time / 1000
-        # Find the steppers count of the main axis
-        self.registers["stepper_count"] = self.get_stepper_count(axis)
-
-        self.driver, self.sense_resistor = self.detect_driver(stepper=axis)
-        self.validate_tpfd_values(self.driver, tpfd_min, tpfd_max)
+        driver, sense = self.detect_driver(stepper=axis)
+        if driver not in ("2240", "5160"):
+            raise self.printer.command_error(
+                f"Only TMC2240/TMC5160 are supported in U1 mode (got TMC{driver})"
+            )
+        self.driver = driver
+        self.sense_resistor = sense
 
         axes, steppers = self.get_axes_and_steppers(axis)
+        self.steppers = list(steppers)
+        self.registers["stepper_count"] = self.get_stepper_count(axis)
 
-        a_axis_min, a_axis_max, a_axis_mid, b_axis_mid = self.get_axis_limits(axes)
-        acceleration, self.travel_speed = self.get_travel_speed_and_acceleration(axes)
-        accel_chip = self.get_accelerometer_chip(accel_chip)
+        accel_chip_name = self.get_accelerometer_chip(accel_chip if accel_chip else "default")
+        accel_obj = self._u1_lookup_accel_object(accel_chip_name)
+        self._accel_data_rate_hz = float(getattr(accel_obj, "data_rate", 1600.0))
+        self._lpf_cutoff_hz = float(lpf_cutoff_hz)
 
-        current_min, current_max = self.get_current_range(
-            self.measurement_mode, current_min, current_max, steppers
-        )
-
-        if self.measurement_mode == MeasurementMode.Resonances:
-            # In vibration measurement mode,
-            # search and take registers from printer.cfg
-            (
-                tbl_min,
-                tbl_max,
-                toff_min,
-                toff_max,
-                hstrt_min,
-                hstrt_max,
-                hend_min,
-                hend_max,
-            ) = self.get_default_stepper_parameters(steppers)
-
-        (min_speed, max_speed, speed_change_step) = self.configure_speed_limits(
-            min_speed,
-            max_speed,
-            speed_change_step,
-            measure_time,
-            axes,
-            steppers,
-            a_axis_min,
-            a_axis_max,
-            acceleration,
-        )
-
-        travel_distance = self.calculate_travel_distance(
-            axes,
-            a_axis_min,
-            a_axis_max,
-            max_speed,
-            acceleration,
-            measure_time,
-            travel_distance,
-        )
-
-        # Info message
-        self.display_process_summary(
-            current_min,
-            current_max,
-            tbl_min,
-            tbl_max,
-            toff_min,
-            toff_max,
-            hstrt_min,
-            hstrt_max,
-            hend_min,
-            hend_max,
-            tpfd_min,
-            tpfd_max,
-            min_speed,
-            max_speed,
-            speed_change_step,
-            self.iterations,
-            self.search_method,
-            a_axis_min,
-            travel_distance,
-        )
-
-        # Home regardless of previous homing state
-        self.home()
+        # Motion bounds (use bed_mesh safe box if present).
+        xmin, xmax, ymin, ymax = self._u1_get_safe_xy_bounds(inset=inset)
+        center_x = (xmin + xmax) / 2.0
+        center_y = (ymin + ymax) / 2.0
         home_pos = Coord(self.toolhead.get_position())
+        center = Coord((center_x, center_y, home_pos.z))
 
-        # Get initial position and direction
-        self.initial_position = {
-            "x": Coord((a_axis_mid, b_axis_mid, home_pos.z)),
-            "y": Coord((b_axis_mid, a_axis_mid, home_pos.z)),
-            "z": Coord((b_axis_mid, home_pos.y, a_axis_mid)),
-        }[axes[0]]
-        self.initial_direction = self.get_initial_direction(axes)
-        if direction == -1:
-            self.initial_direction = self.initial_direction * -1
+        # Direction and max travel distance along that direction.
+        direction = self.get_initial_direction(list(axes))
+        avail_dist = self._u1_max_travel_distance_xy(
+            center_x=center.x,
+            center_y=center.y,
+            dir_x=direction.x,
+            dir_y=direction.y,
+            xmin=xmin,
+            xmax=xmax,
+            ymin=ymin,
+            ymax=ymax,
+        )
+        if avail_dist <= 0:
+            raise self.printer.command_error("No available travel distance in safe bounds")
 
-        self.toolhead.set_max_velocities(None, acceleration, None, None)
+        acceleration, self.travel_speed = self.get_travel_speed_and_acceleration(list(axes))
+        self._u1_set_accel(acceleration)
 
-        # move away from the middle exactly half or a travel distance
-        self.initial_position -= self.initial_direction * (travel_distance / 2)
-        self.toolhead.manual_move(self.initial_position, self.travel_speed)
-        self.toolhead.wait_moves()
-
-        # Measure accelerometer noise
-        samples = self.get_standing_acceleration()
-        self.static_noise_vector = self.calc_static_magnitude(samples)
-        self.static_noise_magnitude = float(np.linalg.norm(self.static_noise_vector))
-
-        # set the global start time here
-        self.global_start_time = self.reactor.monotonic()
-
-        nv = self.static_noise_vector
-        self.gcode.respond_info(
-            f"Static noise vector    = {nv[0]:0.1f} {nv[1]:0.1f} {nv[2]:0.1f} mm/s²\n"
-            f"Static noise magnitude = {self.static_noise_magnitude:.1f} mm/s²\n"
-            "(HINT: this should be close to earth's gravity of 9806 mm/s²)"
+        # Speed range (use required_rpm from config).
+        measure_time = float(self.measure_time) / 1000.0
+        rotation_dist = self.stepper_settings[steppers[0]].get("rotation_distance")
+        gear_ratio = self.stepper_settings[steppers[0]].get("gear_ratio") or ((1, 1),)
+        gear_ratio = tuple(float(r) for r in gear_ratio[0])
+        full_steps_per_rotation = self.stepper_settings[steppers[0]].get(
+            "full_steps_per_rotation", 200
+        )
+        steps_multiplier = (
+            full_steps_per_rotation
+            / 200
+            / (float(gear_ratio[0]) / float(gear_ratio[1]))
+            * rotation_dist
+            / 60.0
         )
 
-        # Create the coordinate generator
-        coord_generator = CoordGenerator(
-            direction=self.initial_direction,
-            start_coord=self.initial_position,
-        )
+        min_speed = float(self.required_rpm[0] * steps_multiplier)
+        max_required_speed = float(self.required_rpm[1] * steps_multiplier)
+        speed_step = float(self.required_rpm[2] * steps_multiplier)
 
-        # calculated vars
-        self.travel_distance = travel_distance
-        self.coord_generator = coord_generator
-        self.accel_chip = accel_chip
-        self.steppers = steppers
-        self.current = current_min
-
-        # bounds
-        self.min_speed = min_speed
-        self.max_speed = max_speed
-        self.speed_change_step = speed_change_step
-        self.current_min = current_min
-        self.current_max = current_max
-
-        self.tbl_min = tbl_min
-        self.tbl_max = tbl_max
-        self.toff_min = toff_min
-        self.toff_max = toff_max
-        self.hstrt_min = hstrt_min
-        self.hstrt_max = hstrt_max
-        self.hstrt_hend_max = hstrt_hend_max
-        self.hend_min = hend_min
-        self.hend_max = hend_max
-        self.tpfd_min = tpfd_min
-        self.tpfd_max = tpfd_max
-
-        self.bounds = [
-            (self.current_min, self.current_max),
-            (self.tbl_min, self.tbl_max),
-            (self.toff_min, self.toff_max),
-            (self.hstrt_min, self.hstrt_max),
-            (self.hend_min, self.hend_max),
-            (self.tpfd_min, self.tpfd_max),
-        ]
-        best_parameters = self.search_best_parameters()
-        if self.measurement_mode == MeasurementMode.Resonances:
-            max_vibrations_and_speed = sorted(
-                self.speed_vs_vibrations, key=lambda x: x[1]
-            )[-1]
+        # Limit max speed by available travel distance for the requested measure_time.
+        # Solve v^2/accel + v*t <= avail_dist for v.
+        max_speed_by_dist = (
+            (-acceleration * measure_time)
+            + math.sqrt((acceleration * measure_time) ** 2 + 4.0 * acceleration * avail_dist)
+        ) / 2.0
+        max_velocity = float(self.settings["printer"].get("max_velocity"))
+        max_speed = min(max_required_speed, max_speed_by_dist, max_velocity)
+        if max_speed < min_speed:
             self.gcode.respond_info(
-                "Finding resonances took "
-                f"{self.convert_seconds_to_hms(self.get_time_elapsed())}\n"
-                "Max vibrations seems to be at "
-                f"{max_vibrations_and_speed[0]:0.1f} mm/s"
+                f"WARNING: computed max_speed={max_speed:.1f} < min_speed={min_speed:.1f}; clamping to min_speed"
+            )
+            max_speed = min_speed
+
+        # Compute desired travel distance for max_speed; clamp to bounds if needed.
+        accel_decel_distance = (max_speed * max_speed) / float(acceleration)
+        desired_dist = accel_decel_distance + (max_speed * measure_time)
+        travel_dist = min(desired_dist, avail_dist)
+        if travel_dist < desired_dist:
+            self.gcode.respond_info(
+                f"WARNING: travel distance clamped by safe bounds: {travel_dist:.1f}mm < {desired_dist:.1f}mm"
             )
 
-        self.toolhead.dwell(0.5)
-        self.toolhead.manual_move((a_axis_mid,), self.travel_speed)
+        start = center - direction * (travel_dist / 2.0)
+        end = center + direction * (travel_dist / 2.0)
+
+        # Baseline noise (standing still).
+        self.toolhead.manual_move(center, self.travel_speed)
         self.toolhead.wait_moves()
-        now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if run_plotter:
-            self.gcode.respond_info("Magnitude graphs generation...")
-            self.gcode.respond_info("This may take a while, please wait")
-            self.plot_data(date_stamp=now)
+        with AccelerometerMeasure(accel_obj) as am:
+            self.toolhead.dwell(float(baseline_dwell))
+        static_vec = self.calc_static_magnitude(am.samples or [])
+        static_mag = math.sqrt(static_vec[0] ** 2 + static_vec[1] ** 2 + static_vec[2] ** 2)
+        self.static_noise_vector = static_vec
+        self.static_noise_magnitude = static_mag
 
-        # Store data
-        self.store_data(date_stamp=now)
+        self.gcode.respond_info(
+            f"U1 phased mode | axis={axis.upper()} | driver=TMC{driver} | accel={accel_chip_name}\n"
+            f"Safe box: X {xmin:.1f}..{xmax:.1f}, Y {ymin:.1f}..{ymax:.1f} (INSET={inset})\n"
+            f"Travel: {travel_dist:.1f}mm (available {avail_dist:.1f}mm) | Speed range: {min_speed:.1f}..{max_speed:.1f} mm/s\n"
+            f"Static noise magnitude: {static_mag:.1f} mm/s²"
+        )
 
-        # Save Config
+        # Cache: (key, speed, dir) -> score
+        score_cache: dict[tuple, float] = {}
+        measurements: list[dict[str, object]] = []
+
+        def measure_bidir_current(speed: float) -> tuple[float, float, float]:
+            """Bidirectional score at current register state (no SET_TMC_FIELD)."""
+            sp = round(float(speed), 4)
+            fwd = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=start,
+                end=end,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(("baseline",), sp, "fwd"),
+            )
+            rev = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=end,
+                end=start,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(("baseline",), sp, "rev"),
+            )
+            return fwd, rev, max(fwd, rev)
+
+        def measure_bidir_tbl_toff(tbl: int, toff: int, speed: float) -> tuple[float, float, float]:
+            """Phase 2: vary TBL/TOFF only; keep other registers at their current values."""
+            params_key = ("tbl_toff", int(tbl), int(toff))
+            sp = round(float(speed), 4)
+            self.apply_registers(self.steppers, "tbl", int(tbl))
+            self.apply_registers(self.steppers, "toff", int(toff))
+            fwd = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=start,
+                end=end,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(params_key, sp, "fwd"),
+            )
+            rev = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=end,
+                end=start,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(params_key, sp, "rev"),
+            )
+            return fwd, rev, max(fwd, rev)
+
+        def measure_bidir_hyst(tbl: int, toff: int, hstrt: int, hend: int, speed: float) -> tuple[float, float, float]:
+            """Phase 3: vary HSTRT/HEND for a selected (TBL,TOFF)."""
+            params_key = ("hyst", int(tbl), int(toff), int(hstrt), int(hend))
+            sp = round(float(speed), 4)
+            self.apply_registers(self.steppers, "tbl", int(tbl))
+            self.apply_registers(self.steppers, "toff", int(toff))
+            self.apply_registers(self.steppers, "hstrt", int(hstrt))
+            self.apply_registers(self.steppers, "hend", int(hend))
+            fwd = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=start,
+                end=end,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(params_key, sp, "fwd"),
+            )
+            rev = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=end,
+                end=start,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(params_key, sp, "rev"),
+            )
+            return fwd, rev, max(fwd, rev)
+
+        def measure_bidir_tpfd(
+            tbl: int, toff: int, hstrt: int, hend: int, tpfd: int, speed: float
+        ) -> tuple[float, float, float]:
+            """Phase 4: vary TPFD for a selected (TBL,TOFF,HSTRT,HEND)."""
+            params_key = ("tpfd", int(tbl), int(toff), int(hstrt), int(hend), int(tpfd))
+            sp = round(float(speed), 4)
+            self.apply_registers(self.steppers, "tbl", int(tbl))
+            self.apply_registers(self.steppers, "toff", int(toff))
+            self.apply_registers(self.steppers, "hstrt", int(hstrt))
+            self.apply_registers(self.steppers, "hend", int(hend))
+            self.apply_registers(self.steppers, "tpfd", int(tpfd))
+            fwd = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=start,
+                end=end,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(params_key, sp, "fwd"),
+            )
+            rev = self._u1_measure_score(
+                accel_obj,
+                static_vec,
+                start=end,
+                end=start,
+                speed=sp,
+                cache=score_cache,
+                cache_key=(params_key, sp, "rev"),
+            )
+            return fwd, rev, max(fwd, rev)
+
+        def pick_speeds() -> tuple[float, float, float, list[dict[str, object]]]:
+            # Phase 1: adaptive resonance speed selection (limited sampling).
+            n0 = 9 if quick else 13
+            speeds = [min_speed + i * (max_speed - min_speed) / (n0 - 1) for i in range(n0)]
+
+            scored: list[tuple[float, float]] = []
+            speed_records: list[dict[str, object]] = []
+            for sp in speeds:
+                _, _, s = measure_bidir_current(sp)
+                scored.append((float(sp), float(s)))
+                speed_records.append({"speed": float(sp), "score": float(s)})
+
+            # refine around best speed
+            best_sp, best_score = max(scored, key=lambda t: t[1])
+            window = (max_speed - min_speed) / max(4.0, float(n0))
+            for _ in range(2 if quick else 3):
+                cand = [best_sp - window, best_sp - window / 2, best_sp, best_sp + window / 2, best_sp + window]
+                cand = [sp for sp in cand if min_speed <= sp <= max_speed]
+                for sp in cand:
+                    _, _, s = measure_bidir_current(sp)
+                    if s > best_score:
+                        best_sp, best_score = float(sp), float(s)
+                window *= 0.5
+
+            speed_peak = float(best_sp)
+            # mid: 2nd best away from the peak, else midpoint.
+            scored_sorted = sorted(scored, key=lambda t: t[1], reverse=True)
+            min_sep = 0.10 * (max_speed - min_speed)
+            speed_mid = None
+            for sp, sc in scored_sorted[1:]:
+                if abs(sp - speed_peak) >= min_sep:
+                    speed_mid = float(sp)
+                    break
+            if speed_mid is None:
+                speed_mid = float((min_speed + max_speed) / 2.0)
+            speed_high = float(min_speed + 0.80 * (max_speed - min_speed))
+            return speed_peak, speed_mid, speed_high, speed_records
+
+        speed_peak, speed_mid, speed_high, speed_scan = pick_speeds()
+        self.gcode.respond_info(
+            f"Selected speeds: peak={speed_peak:.1f}, mid={speed_mid:.1f}, high={speed_high:.1f} mm/s"
+        )
+
+        # Phase 5 baseline validation measurements (before changing any registers).
+        baseline_scores = {}
+        for name, sp in (("peak", speed_peak), ("mid", speed_mid), ("high", speed_high)):
+            _, _, s = measure_bidir_current(sp)
+            baseline_scores[name] = float(s)
+
+        raw_files: list[str] = []
+        if raw:
+            raw_dir = run_dirs["results"] / "raw"
+            # Capture raw accel samples for baseline and tuned at the peak speed only
+            # (full raw capture for every scan point would be too large).
+            base_fwd = self._u1_measure_move(accel_obj, start=start, end=end, speed=float(speed_peak))
+            base_rev = self._u1_measure_move(accel_obj, start=end, end=start, speed=float(speed_peak))
+            p1 = raw_dir / "baseline_peak_fwd.csv"
+            p2 = raw_dir / "baseline_peak_rev.csv"
+            self._u1_write_samples_csv(p1, base_fwd)
+            self._u1_write_samples_csv(p2, base_rev)
+            raw_files += [str(p1), str(p2)]
+
+        # Phase 2: coarse scan TBL x TOFF
+        coarse_rows: list[dict[str, object]] = []
+        for tbl in range(0, 4):
+            for toff in range(1, 9):
+                freq_hz = float(self.calculate_frequency(tbl, toff))
+                penalty_factor = self._u1_noise_penalty_factor(freq_hz=freq_hz, mode=noise_penalty)
+
+                speeds_to_check = [("peak", speed_peak)]
+                if not quick:
+                    speeds_to_check += [("mid", speed_mid), ("high", speed_high)]
+
+                per_speed: dict[str, float] = {}
+                for label, sp in speeds_to_check:
+                    fwd, rev, s = measure_bidir_tbl_toff(tbl, toff, sp)
+                    per_speed[label] = float(s)
+                    measurements.append(
+                        {
+                            "phase": "coarse",
+                            "tbl": tbl,
+                            "toff": toff,
+                            "hstrt": None,  # kept current
+                            "hend": None,  # kept current
+                            "tpfd": None,  # kept current
+                            "speed": float(sp),
+                            "fwd": float(fwd),
+                            "rev": float(rev),
+                            "score": float(s),
+                            "freq_hz": freq_hz,
+                        }
+                    )
+
+                if quick:
+                    score_total = per_speed["peak"]
+                else:
+                    score_total = (
+                        0.50 * per_speed["peak"]
+                        + 0.30 * per_speed["mid"]
+                        + 0.20 * per_speed["high"]
+                    )
+                score_total *= float(penalty_factor)
+
+                coarse_rows.append(
+                    {
+                        "tbl": tbl,
+                        "toff": toff,
+                        "freq_hz": freq_hz,
+                        "penalty_factor": float(penalty_factor),
+                        "score_total": float(score_total),
+                        "scores": per_speed,
+                    }
+                )
+
+        coarse_rows_sorted = sorted(coarse_rows, key=lambda r: r["score_total"])
+        top_k = 1 if quick else 3
+        top_candidates = coarse_rows_sorted[:top_k]
+
+        self.gcode.respond_info(
+            "Top coarse candidates: "
+            + ", ".join(
+                [
+                    f"TBL={c['tbl']} TOFF={c['toff']} score={c['score_total']:.1f}"
+                    for c in top_candidates
+                ]
+            )
+        )
+
+        # Phase 3: fine scan HSTRT x HEND on top candidates
+        fine_rows: list[dict[str, object]] = []
+        for cand in top_candidates:
+            tbl = int(cand["tbl"])
+            toff = int(cand["toff"])
+            for hstrt in range(0, 8):
+                for hend in range(2, 16):
+                    if hstrt + hend > 16:
+                        continue
+                    fwd, rev, s = measure_bidir_hyst(tbl, toff, hstrt, hend, speed_peak)
+                    row = {
+                        "tbl": tbl,
+                        "toff": toff,
+                        "hstrt": hstrt,
+                        "hend": hend,
+                        "tpfd": None,  # kept current
+                        "speed": float(speed_peak),
+                        "fwd": float(fwd),
+                        "rev": float(rev),
+                        "score": float(s),
+                    }
+                    fine_rows.append(row)
+                    measurements.append({"phase": "fine", **row})
+
+        if not fine_rows:
+            raise self.printer.command_error("Fine scan produced no candidates")
+
+        # Robust fine selection:
+        # - Scan HSTRT/HEND at peak (fast, high-SNR).
+        # - Then re-score only the top N at additional speeds to avoid choosing a
+        #   candidate that only improves at one speed.
+        fine_rows_sorted = sorted(fine_rows, key=lambda r: float(r["score"]))
+        fine_top_n = 3 if quick else 5
+        fine_shortlist = fine_rows_sorted[: max(1, min(fine_top_n, len(fine_rows_sorted)))]
+
+        fine_ranked: list[dict[str, object]] = []
+        for r in fine_shortlist:
+            tbl = int(r["tbl"])
+            toff = int(r["toff"])
+            hstrt = int(r["hstrt"])
+            hend = int(r["hend"])
+
+            per_speed = {"peak": float(r["score"])}
+            extra_speeds = [("high", speed_high)] if quick else [("mid", speed_mid), ("high", speed_high)]
+            for label, sp in extra_speeds:
+                fwd, rev, s = measure_bidir_hyst(tbl, toff, hstrt, hend, sp)
+                per_speed[label] = float(s)
+                measurements.append(
+                    {
+                        "phase": "fine_rescore",
+                        "label": label,
+                        "tbl": tbl,
+                        "toff": toff,
+                        "hstrt": hstrt,
+                        "hend": hend,
+                        "tpfd": None,
+                        "speed": float(sp),
+                        "fwd": float(fwd),
+                        "rev": float(rev),
+                        "score": float(s),
+                    }
+                )
+
+            if quick:
+                score_total = 0.70 * per_speed["peak"] + 0.30 * per_speed["high"]
+            else:
+                score_total = (
+                    0.50 * per_speed["peak"]
+                    + 0.30 * per_speed["mid"]
+                    + 0.20 * per_speed["high"]
+                )
+
+            freq_hz = float(self.calculate_frequency(tbl, toff))
+            score_total *= float(self._u1_noise_penalty_factor(freq_hz=freq_hz, mode=noise_penalty))
+
+            fine_ranked.append({**r, "scores": per_speed, "score_total": float(score_total)})
+
+        fine_ranked_sorted = sorted(fine_ranked, key=lambda rr: float(rr["score_total"]))
+        fine_best = fine_ranked_sorted[0]
+        self.gcode.respond_info(
+            "Top fine candidates: "
+            + ", ".join(
+                [
+                    f"HSTRT={int(c['hstrt'])} HEND={int(c['hend'])} score={float(c['score_total']):.1f}"
+                    for c in fine_ranked_sorted[: min(3, len(fine_ranked_sorted))]
+                ]
+            )
+        )
+
+        # Phase 4: TPFD scan (2240/5160)
+        tuned = dict(fine_best)
+        tpfd_rows: list[dict[str, object]] = []
+        if driver in ("2240", "5160"):
+            for tpfd in range(0, 16):
+                fwd, rev, s = measure_bidir_tpfd(
+                    tuned["tbl"],
+                    tuned["toff"],
+                    tuned["hstrt"],
+                    tuned["hend"],
+                    tpfd,
+                    speed_peak,
+                )
+                row = {
+                    "tbl": tuned["tbl"],
+                    "toff": tuned["toff"],
+                    "hstrt": tuned["hstrt"],
+                    "hend": tuned["hend"],
+                    "tpfd": tpfd,
+                    "speed": float(speed_peak),
+                    "fwd": float(fwd),
+                    "rev": float(rev),
+                    "score": float(s),
+                }
+                tpfd_rows.append(row)
+                measurements.append({"phase": "tpfd", **row})
+
+            # Robust TPFD selection: re-score top N at extra speeds.
+            tpfd_rows_sorted = sorted(tpfd_rows, key=lambda r: float(r["score"]))
+            tpfd_top_n = 3 if quick else 5
+            tpfd_shortlist = tpfd_rows_sorted[: max(1, min(tpfd_top_n, len(tpfd_rows_sorted)))]
+
+            tpfd_ranked: list[dict[str, object]] = []
+            for r in tpfd_shortlist:
+                tbl = int(r["tbl"])
+                toff = int(r["toff"])
+                hstrt = int(r["hstrt"])
+                hend = int(r["hend"])
+                tpfd = int(r["tpfd"])
+
+                per_speed = {"peak": float(r["score"])}
+                extra_speeds = [("high", speed_high)] if quick else [("mid", speed_mid), ("high", speed_high)]
+                for label, sp in extra_speeds:
+                    fwd, rev, s = measure_bidir_tpfd(tbl, toff, hstrt, hend, tpfd, sp)
+                    per_speed[label] = float(s)
+                    measurements.append(
+                        {
+                            "phase": "tpfd_rescore",
+                            "label": label,
+                            "tbl": tbl,
+                            "toff": toff,
+                            "hstrt": hstrt,
+                            "hend": hend,
+                            "tpfd": tpfd,
+                            "speed": float(sp),
+                            "fwd": float(fwd),
+                            "rev": float(rev),
+                            "score": float(s),
+                        }
+                    )
+
+                if quick:
+                    score_total = 0.70 * per_speed["peak"] + 0.30 * per_speed["high"]
+                else:
+                    score_total = (
+                        0.50 * per_speed["peak"]
+                        + 0.30 * per_speed["mid"]
+                        + 0.20 * per_speed["high"]
+                    )
+
+                freq_hz = float(self.calculate_frequency(tbl, toff))
+                score_total *= float(self._u1_noise_penalty_factor(freq_hz=freq_hz, mode=noise_penalty))
+
+                tpfd_ranked.append({**r, "scores": per_speed, "score_total": float(score_total)})
+
+            tpfd_ranked_sorted = sorted(tpfd_ranked, key=lambda rr: float(rr["score_total"]))
+            tuned = dict(tpfd_ranked_sorted[0])
+            self.gcode.respond_info(
+                "Top TPFD candidates: "
+                + ", ".join(
+                    [
+                        f"TPFD={int(c['tpfd'])} score={float(c['score_total']):.1f}"
+                        for c in tpfd_ranked_sorted[: min(3, len(tpfd_ranked_sorted))]
+                    ]
+                )
+            )
+
+        # Apply tuned registers (final).
+        self.apply_registers(self.steppers, "tbl", int(tuned["tbl"]))
+        self.apply_registers(self.steppers, "toff", int(tuned["toff"]))
+        self.apply_registers(self.steppers, "hstrt", int(tuned["hstrt"]))
+        self.apply_registers(self.steppers, "hend", int(tuned["hend"]))
+        self.apply_registers(self.steppers, "tpfd", int(tuned.get("tpfd", 0)))
+
+        if raw:
+            raw_dir = run_dirs["results"] / "raw"
+            tuned_fwd = self._u1_measure_move(accel_obj, start=start, end=end, speed=float(speed_peak))
+            tuned_rev = self._u1_measure_move(accel_obj, start=end, end=start, speed=float(speed_peak))
+            p1 = raw_dir / "tuned_peak_fwd.csv"
+            p2 = raw_dir / "tuned_peak_rev.csv"
+            self._u1_write_samples_csv(p1, tuned_fwd)
+            self._u1_write_samples_csv(p2, tuned_rev)
+            raw_files += [str(p1), str(p2)]
+
+        # Phase 5 validation: tuned vs baseline at the 3 speeds
+        tuned_scores = {}
+        for name, sp in (("peak", speed_peak), ("mid", speed_mid), ("high", speed_high)):
+            fwd, rev, s = measure_bidir_tpfd(
+                int(tuned["tbl"]),
+                int(tuned["toff"]),
+                int(tuned["hstrt"]),
+                int(tuned["hend"]),
+                int(tuned.get("tpfd", 0)),
+                sp,
+            )
+            tuned_scores[name] = float(s)
+            measurements.append(
+                {
+                    "phase": "validation_tuned",
+                    "tbl": int(tuned["tbl"]),
+                    "toff": int(tuned["toff"]),
+                    "hstrt": int(tuned["hstrt"]),
+                    "hend": int(tuned["hend"]),
+                    "tpfd": int(tuned.get("tpfd", 0)),
+                    "speed": float(sp),
+                    "fwd": float(fwd),
+                    "rev": float(rev),
+                    "score": float(s),
+                }
+            )
+
+        validation = {
+            "baseline": baseline_scores,
+            "tuned": tuned_scores,
+            # Positive values mean improvement (lower vibrations after tuning).
+            "delta": {k: float(baseline_scores[k] - tuned_scores[k]) for k in baseline_scores},
+        }
+
+        # This tuner currently calibrates chopper (SpreadCycle) fields only.
+        # Do not modify run_current.
+        best_parameters = {
+            "tbl": int(tuned["tbl"]),
+            "toff": int(tuned["toff"]),
+            "hstrt": int(tuned["hstrt"]),
+            "hend": int(tuned["hend"]),
+            "tpfd": int(tuned.get("tpfd", 0)),
+        }
+
         self.save_configs(best_parameters)
+        tuned_freq_hz = float(self.calculate_frequency(best_parameters["tbl"], best_parameters["toff"]))
+        self.gcode.respond_info(
+            "Tuned parameters:\n"
+            f"  driver_tbl={best_parameters['tbl']}\n"
+            f"  driver_toff={best_parameters['toff']} (f_chop~{tuned_freq_hz/1000.0:.1f} kHz)\n"
+            f"  driver_hstrt={best_parameters['hstrt']}\n"
+            f"  driver_hend={best_parameters['hend']}\n"
+            f"  driver_tpfd={best_parameters['tpfd']}"
+        )
+        self.gcode.respond_info(
+            "Validation (baseline - tuned, + means improvement):\n"
+            f"  peak: {validation['delta']['peak']:.1f} mm/s²\n"
+            f"  mid : {validation['delta']['mid']:.1f} mm/s²\n"
+            f"  high: {validation['delta']['high']:.1f} mm/s²"
+        )
 
-        # Compare best result with previous samples
-        if best_parameters and compare_with is not None:
-            sample_name = self.generate_sample_name(
-                best_parameters["current"],
-                best_parameters["tbl"],
-                best_parameters["toff"],
-                best_parameters["hstrt"],
-                best_parameters["hend"],
-                best_parameters["tpfd"],
-                best_parameters["speed"],
-            )
-            self.compare_results(
-                sample_name,
-                self.samples[sample_name],
-                compare_with,
-            )
+        payload = {
+            "meta": run_meta,
+            "dirs": {k: str(v) for k, v in run_dirs.items()},
+            "driver": {"model": f"tmc{driver}", "stepper": steppers[0], "sense_resistor": sense},
+            "accel": {"chip": accel_chip_name, "data_rate_hz": self._accel_data_rate_hz},
+            "safe_box": {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax},
+            "motion": {"travel_distance_mm": travel_dist, "accel": acceleration, "travel_speed": self.travel_speed},
+            "speed_range": {"min": min_speed, "max": max_speed, "step": speed_step},
+            "speeds": {"peak": speed_peak, "mid": speed_mid, "high": speed_high, "scan": speed_scan},
+            "baseline": {"static_vector": static_vec, "static_magnitude": static_mag, "scores": baseline_scores},
+            "tuned": {"params": best_parameters, "validation": validation},
+            "measurements": measurements,
+            "raw_files": raw_files,
+        }
 
-        # reset samples related data
-        self.total_expected_samples = -1
-        self.number_of_samples = 0
-        self.number_of_real_samples = 0
-        self.samples = {}
-
+        self._u1_write_json(run_dirs["results"] / "run.json", payload)
+        self.gcode.respond_info(
+            "CHOPPER_TUNE complete. Saved JSON to "
+            f"{str(run_dirs['results'] / 'run.json')}"
+        )
         return best_parameters
 
     def generate_sample_name(
@@ -1654,53 +2284,7 @@ class ChopperTune:
             f"freq={freq / 1000:.2f}kHz"
         )
 
-    def compare_results(
-        self,
-        sample_name: str,
-        sample_result: float,
-        previous_samples_name: str,
-    ) -> tuple[None | float, None | float]:
-        """Compare current sample result with previous samples.
-
-        Args:
-            sample_name (str): The name of the current sample.
-            sample_result (float): The result of the current sample.
-            previous_samples_name (str): The name of the previous samples file.
-
-        Returns:
-            tuple[None | float, None | float]: The percentile of the given
-                value within the previous samples, and the previously measured
-                value for the sample name.
-        """
-        previous_sample_path = os.path.join(
-            RESULTS_FOLDER, f"{previous_samples_name}.json"
-        )
-        if not os.path.exists(previous_sample_path):
-            return None, None
-
-        with open(previous_sample_path) as f:
-            previous_samples = json.load(f)
-
-        previous_values = np.array(list(previous_samples.values()))
-        previous_sample_result = previous_samples.get(sample_name)
-        percentile = float((previous_values <= sample_result).mean())
-
-        # report comparison results
-        message = (
-            "Comparison with previous samples:\n---------------------------------\n"
-        )
-        if percentile is not None:
-            message += f"Sample    : {sample_name}\nPercentile: {percentile:.2%}\n"
-        if previous_sample_result is not None:
-            message += (
-                f"Previous value\n"
-                f"for the same\n"
-                f"sample    : {previous_sample_result:.1f} mm/s²"
-            )
-        if percentile is None and previous_sample_result is None:
-            message += "No previous sample data found for comparison!!!\n"
-        self.gcode.respond_info(message)
-        return percentile, previous_sample_result
+    # Legacy compare_results() removed in U1 mode (avoids third-party deps).
 
     def get_time_elapsed(self) -> float:
         """Get elapsed time since the start of the process.
@@ -1894,100 +2478,16 @@ class ChopperTune:
         return best_params
 
     def perform_brute_force_search(self) -> list[int]:
-        """Perform brute-force search for optimal parameters.
-
-        Returns:
-            list[int]: The best parameters found.
-        """
-        # Brute-force search
-        bounds = [
-            slice(self.current_min, self.current_max + 1, self.current_change_step),
-            slice(self.tbl_min, self.tbl_max + 1, 1),
-            slice(self.toff_min, self.toff_max + 1, 1),
-            slice(self.hstrt_min, self.hstrt_max + 1, 1),
-            slice(self.hend_min, self.hend_max + 1, 1),
-            slice(self.tpfd_min, self.tpfd_max + 1, 1),
-            slice(
-                int(self.min_speed * 100),
-                int(self.max_speed * 100) + 1,
-                int(self.speed_change_step * 100),
-            ),
-        ]
-
-        # update total expected samples
-        total_current_steps = (
-            self.current_max - self.current_min
-        ) // self.current_change_step + 1
-        total_tbl_steps = self.tbl_max - self.tbl_min + 1
-        total_toff_steps = self.toff_max - self.toff_min + 1
-        total_hstrt_steps = self.hstrt_max - self.hstrt_min + 1
-        total_hend_steps = self.hend_max - self.hend_min + 1
-        total_tpfd_steps = self.tpfd_max - self.tpfd_min + 1
-        total_speed_steps = (
-            int(self.max_speed * 100) - int(self.min_speed * 100)
-        ) // int(self.speed_change_step * 100) + 1
-        self.total_expected_samples = (
-            total_current_steps
-            * total_tbl_steps
-            * total_toff_steps
-            * total_hstrt_steps
-            * total_hend_steps
-            * total_tpfd_steps
-            * total_speed_steps
+        """Legacy SciPy-based optimization (not supported on U1)."""
+        raise self.printer.command_error(
+            "SEARCH_METHOD=brute_force is not supported in this fork (no SciPy/Numpy on U1)"
         )
-
-        result = brute(
-            self.objective_function,
-            bounds,
-            finish=None,  # disable local optimization at the end
-        )
-
-        return [round(p) for p in result]
 
     def perform_adaptive_search(self) -> list[int]:
-        """Perform adaptive search for optimal parameters.
-
-        Returns:
-            list[int]: The best parameters found.
-        """
-        # Adaptive search
-        # 'strategy' and 'popsize' are tuned to reduce total measurements
-        # 'tol' can be higher since our parameters are discrete
-
-        bounds = [
-            (self.current_min, self.current_max),
-            (self.tbl_min, self.tbl_max),
-            (self.toff_min, self.toff_max),
-            (self.hstrt_min, self.hstrt_max),
-            (self.hend_min, self.hend_max),
-            (self.tpfd_min, self.tpfd_max),
-            (self.min_speed * 100, self.max_speed * 100),
-        ]
-
-        number_of_changing_params = 0
-        for bound in bounds:
-            if bound[0] != bound[1]:
-                number_of_changing_params += 1
-        number_of_changing_params += 1  # add one for safety
-
-        maxiter = 10
-        popsize = 5
-        self.total_expected_samples = maxiter * popsize * number_of_changing_params
-        result = differential_evolution(
-            self.objective_function,
-            bounds,
-            init="sobol",
-            strategy="best1bin",
-            maxiter=maxiter,
-            popsize=popsize,  # Total evaluations = maxiter * popsize * N_params
-            tol=0.05,  # Higher tolerance for discrete parameters
-            mutation=(0.3, 0.8),
-            recombination=0.9,  # Increased for faster parameter mixing
-            polish=False,  # Polish uses local minimize, which we avoid for discrete
-            updating="immediate",  # Uses best results immediately
+        """Legacy SciPy-based optimization (not supported on U1)."""
+        raise self.printer.command_error(
+            "SEARCH_METHOD=adaptive is not supported in this fork (no SciPy/Numpy on U1)"
         )
-
-        return [round(p) for p in result.x]
 
     def perform_progressive_search(self) -> list[int]:
         """Perform progressive search for optimal parameters.
@@ -2285,78 +2785,50 @@ class ChopperTune:
         return True
 
     def parse_args_and_run_optimization(self, gcmd: GCodeCommand) -> None:
-        """Collect data from G-Code command and run optimization.
-
-        Args:
-            gcmd (GCodeCommand): The G-Code command.
-        """
+        """Collect data from G-Code command and run the U1 phased tuner."""
         try:
             axis = gcmd.get("AXIS", "x").lower()
-            direction = gcmd.get_int("DIRECTION", 1)
-            # search_method can be brute_force or adaptive
-            search_method = SearchMethod.to_method(
-                gcmd.get("SEARCH_METHOD", "brute_force").lower()
-            )
-            current_min = gcmd.get_float("CURRENT_MIN_MA", None)
-            current_max = gcmd.get_float("CURRENT_MAX_MA", None)
-            tbl_min = gcmd.get_int("TBL_MIN", 0)
-            tbl_max = gcmd.get_int("TBL_MAX", 3)
-            toff_min = gcmd.get_int("TOFF_MIN", 1)
-            toff_max = gcmd.get_int("TOFF_MAX", 8)
-            hstrt_hend_max = gcmd.get_int("HSTRT_HEND_MAX", 16)
-            hstrt_min = gcmd.get_int("HSTRT_MIN", 0)
-            hstrt_max = gcmd.get_int("HSTRT_MAX", 7)
-            hend_min = gcmd.get_int("HEND_MIN", 2)
-            hend_max = gcmd.get_int("HEND_MAX", 15)
-            tpfd_min = gcmd.get_int("TPFD_MIN", -1)
-            tpfd_max = gcmd.get_int("TPFD_MAX", -1)
-            min_speed = gcmd.get_float("MIN_SPEED", None)
-            max_speed = gcmd.get_float("MAX_SPEED", None)
-            speed_change_step = gcmd.get_float("SPEED_CHANGE_STEP", None)
+            quick = bool(gcmd.get_int("QUICK", 0))
+            home = bool(gcmd.get_int("HOME", 1))
+            tool = gcmd.get_int("TOOL", 0)
+            inset = float(gcmd.get_float("INSET", self.inset))
+            baseline_dwell = float(gcmd.get_float("BASELINE_DWELL", 5.0))
+            lpf_cutoff_hz = float(gcmd.get_float("LPF_CUTOFF_HZ", 150.0))
+            noise_penalty = gcmd.get("NOISE_PENALTY", "none").lower()
+            raw = bool(gcmd.get_int("RAW", 0))
+
+            # ACCEL_CHIP is hard to pass when it contains spaces (e.g. "lis2dw e0_lis2dw").
+            # Default resolves from [resonance_tester].
+            accel_chip = gcmd.get("ACCEL_CHIP", "default")
+            if accel_chip == "default":
+                # Backwards compat with older docs.
+                accel_chip = gcmd.get("ACCELEROMETER", "default")
+
+            log_path = gcmd.get("LOG_PATH", U1_LOG_ROOT)
+            if log_path.rstrip("/") != U1_LOG_ROOT:
+                raise self.printer.command_error(
+                    f"LOG_PATH must be '{U1_LOG_ROOT}' on Snapmaker U1"
+                )
+
+            # Keep compatibility with old knob, but do not support it in U1 mode.
+            apply_static = bool(gcmd.get_int("APPLY_STATIC", 0))
+            if apply_static:
+                raise self.printer.command_error("APPLY_STATIC=1 is not implemented yet")
+
             self.iterations = gcmd.get_int("ITERATIONS", 1)
-            travel_distance = gcmd.get_float("TRAVEL_DISTANCE", None)
-            accel_chip = gcmd.get("ACCELEROMETER", "default").lower()
-            compare_with = gcmd.get("COMPARE_WITH", None)
 
-            self.measurement_mode = {
-                "0": MeasurementMode.Vibrations,
-                "1": MeasurementMode.Resonances,
-                "false": MeasurementMode.Vibrations,
-                "true": MeasurementMode.Resonances,
-            }.get(
-                gcmd.get("FIND_RESONANCES", "false").lower(), MeasurementMode.Resonances
-            )
-            run_plotter = {
-                "0": False,
-                "1": True,
-                "false": False,
-                "true": True,
-            }.get(gcmd.get("RUN_PLOTTER", "true").lower(), True)
-
-            return self.chopper_tune(
+            self.chopper_tune(
                 axis=axis,
-                current_min=current_min,
-                current_max=current_max,
-                tbl_min=tbl_min,
-                tbl_max=tbl_max,
-                toff_min=toff_min,
-                toff_max=toff_max,
-                hstrt_hend_max=hstrt_hend_max,
-                hstrt_min=hstrt_min,
-                hstrt_max=hstrt_max,
-                hend_min=hend_min,
-                hend_max=hend_max,
-                tpfd_min=tpfd_min,
-                tpfd_max=tpfd_max,
-                min_speed=min_speed,
-                max_speed=max_speed,
-                speed_change_step=speed_change_step,
-                search_method=search_method,
-                travel_distance=travel_distance,
-                direction=direction,
+                quick=quick,
+                home=home,
+                tool=tool,
                 accel_chip=accel_chip,
-                run_plotter=run_plotter,
-                compare_with=compare_with,
+                inset=inset,
+                baseline_dwell=baseline_dwell,
+                lpf_cutoff_hz=lpf_cutoff_hz,
+                noise_penalty=noise_penalty,
+                raw=raw,
+                log_path=log_path,
             )
         except Exception:
             self.gcode.respond_info(traceback.format_exc())
