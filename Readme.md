@@ -52,8 +52,8 @@ T0 A0
 2. Tune X, then tune Y (keep X tuned while tuning Y; CoreXY uses both motors):
 
 ```gcode
-CHOPPER_TUNE AXIS=X QUICK=1 HOME=0
-CHOPPER_TUNE AXIS=Y QUICK=1 HOME=0
+CHOPPER_TUNE AXIS=X QUICK=0 HOME=0
+CHOPPER_TUNE AXIS=Y QUICK=0 HOME=0
 ```
 
 3. Persist results (U1, no `SAVE_CONFIG`):
@@ -98,8 +98,7 @@ driver_SGT: 2 # Default is 1 / higher = less sensitivity
 Main command:
 
 ```gcode
-CHOPPER_TUNE AXIS=X QUICK=0 HOME=0
-CHOPPER_TUNE AXIS=Y QUICK=0 HOME=0
+CHOPPER_TUNE 
 ```
 
 Parameters:
