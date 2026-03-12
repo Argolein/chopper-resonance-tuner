@@ -1697,7 +1697,8 @@ class ChopperTune:
             + math.sqrt((acceleration * measure_time) ** 2 + 4.0 * acceleration * avail_dist)
         ) / 2.0
         max_velocity = float(self.settings["printer"].get("max_velocity"))
-        max_speed = min(max_required_speed, max_speed_by_dist, max_velocity)
+        max_speed_cap = 120.0
+        max_speed = min(max_required_speed, max_speed_by_dist, max_velocity, max_speed_cap)
         if max_speed < min_speed:
             self.gcode.respond_info(
                 f"WARNING: computed max_speed={max_speed:.1f} < min_speed={min_speed:.1f}; clamping to min_speed"
